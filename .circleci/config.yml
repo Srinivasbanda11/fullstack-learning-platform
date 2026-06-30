@@ -1,0 +1,133 @@
+# CircleCI CI/CD Pipeline
+# Learning: CircleCI automates build, test, and deploy on every git push.
+# - Jobs run in isolated containers
+# - Workflows define job order and conditions
+# - Orbs are reusable config packages
+# - Contexts store environment variables securely
+#
+# Flow:
+#   Every push: lint -> type-check -> test
+#   Merge to main: test -> build Docker -> push to ECR -> deploy to EKS
+
+version: 2.1
+
+orbs:
+  node: circleci/node@5.1.0
+  aws-ecr: circleci/aws-ecr@8.2.1
+
+executors:
+  node-executor:
+    docker:
+      - image: cimg/node:18.18
+    environment:
+      NODE_ENV: test
+
+jobs:
+  backend-ci:
+    executor: node-executor
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [backend-deps-v1-{{ checksum "backend/package-lock.json" }}]
+      - run:
+          name: Install dependencies
+          command: cd backend && npm ci
+      - save_cache:
+          key: backend-deps-v1-{{ checksum "backend/package-lock.json" }}
+          paths: [backend/node_modules]
+      - run:
+          name: TypeScript type check
+          command: cd backend && npm run type-check
+      - run:
+          name: Lint
+          command: cd backend && npm run lint
+      - run:
+          name: Tests
+          command: cd backend && npm test -- --forceExit --ci
+      - store_test_results:
+          path: backend/test-results
+
+  frontend-ci:
+    executor: node-executor
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [frontend-deps-v1-{{ checksum "frontend/package-lock.json" }}]
+      - run:
+          name: Install dependencies
+          command: cd frontend && npm ci
+      - save_cache:
+          key: frontend-deps-v1-{{ checksum "frontend/package-lock.json" }}
+          paths: [frontend/node_modules]
+      - run:
+          name: TypeScript type check
+          command: cd frontend && npm run type-check
+      - run:
+          name: Tests
+          command: cd frontend && npm test -- --watchAll=false --ci
+      - run:
+          name: Build
+          command: cd frontend && npm run build
+
+  deploy-to-eks:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install kubectl and aws-cli
+          command: |
+            curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+            pip install awscli
+      - run:
+          name: Configure kubectl for EKS
+          command: |
+            aws eks update-kubeconfig --name jobboard-cluster --region ${AWS_DEFAULT_REGION}
+      - run:
+          name: Deploy backend
+          command: |
+            kubectl set image deployment/jobboard-backend backend=${AWS_ECR_ACCOUNT_URL}/jobboard-backend:${CIRCLE_SHA1} -n production
+            kubectl rollout status deployment/jobboard-backend -n production --timeout=300s
+      - run:
+          name: Deploy frontend
+          command: |
+            kubectl set image deployment/jobboard-frontend frontend=${AWS_ECR_ACCOUNT_URL}/jobboard-frontend:${CIRCLE_SHA1} -n production
+            kubectl rollout status deployment/jobboard-frontend -n production --timeout=300s
+
+workflows:
+  ci:
+    jobs:
+      - backend-ci
+      - frontend-ci
+
+  cd:
+    jobs:
+      - backend-ci:
+          filters: { branches: { only: main } }
+      - frontend-ci:
+          filters: { branches: { only: main } }
+      - aws-ecr/build-and-push-image:
+          name: build-push-backend
+          requires: [backend-ci]
+          account-url: AWS_ECR_ACCOUNT_URL
+          repo: jobboard-backend
+          tag: "${CIRCLE_SHA1},latest"
+          dockerfile: backend/Dockerfile
+          path: backend/
+          context: [aws-credentials]
+          filters: { branches: { only: main } }
+      - aws-ecr/build-and-push-image:
+          name: build-push-frontend
+          requires: [frontend-ci]
+          account-url: AWS_ECR_ACCOUNT_URL
+          repo: jobboard-frontend
+          tag: "${CIRCLE_SHA1},latest"
+          dockerfile: frontend/Dockerfile
+          path: frontend/
+          context: [aws-credentials]
+          filters: { branches: { only: main } }
+      - deploy-to-eks:
+          requires: [build-push-backend, build-push-frontend]
+          context: [aws-credentials]
+          filters: { branches: { only: main } }
