@@ -1,0 +1,127 @@
+# Kubernetes Backend Deployment
+# Learning: K8s manages containerized apps at scale.
+# Key resources: Deployment, Service, HPA, ConfigMap, Secret
+# Apply: kubectl apply -f backend-deployment.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    app: jobboard
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: production
+data:
+  NODE_ENV: "production"
+  PORT: "4000"
+  ELASTICSEARCH_URL: "http://elasticsearch-service:9200"
+  KAFKA_BROKERS: "kafka-service:9092"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobboard-backend
+  namespace: production
+  labels:
+    app: jobboard
+    component: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jobboard
+      component: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: jobboard
+        component: backend
+    spec:
+      containers:
+        - name: backend
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/jobboard-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 4000
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: jwt-secret
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: production
+spec:
+  selector:
+    app: jobboard
+    component: backend
+  ports:
+    - port: 80
+      targetPort: 4000
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: jobboard-backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
